@@ -124,6 +124,11 @@ INSERT OR IGNORE INTO attributes VALUES (13, ':schema/doc',            0, 0, 0, 
 INSERT OR IGNORE INTO attributes VALUES (31, ':schema/attr',           4, 1, 0, 'Attribute IDs in this schema');
 INSERT OR IGNORE INTO attributes VALUES (32, ':schema/attr/required',  4, 1, 0, 'Set of attr_ids that are required for this schema');
 
+INSERT OR IGNORE INTO attributes VALUES (6,  ':attr/of-schema',        4, 1, 0, 'Target schema(s) for ref values (anyOf constraint)');
+
+INSERT OR IGNORE INTO attributes VALUES (41, ':enum/value',            0, 0, 1, 'Enum member label (unique across all enums)');
+INSERT OR IGNORE INTO attributes VALUES (42, ':enum/ordinal',          1, 0, 0, 'Sort order within enum');
+
 -- ============================================================================
 -- Views
 -- ============================================================================
@@ -170,3 +175,21 @@ LEFT JOIN eva_current e2
   AND e2.value = e1.value
 WHERE e1.attribute = 31
 ORDER BY e1.entity_id, e1.value;
+
+-- Enum schemas with their members
+CREATE VIEW IF NOT EXISTS enum_members AS
+SELECT
+  s.entity_id as enum_id,
+  s.type as enum_type,
+  m.entity_id as member_id,
+  MAX(CASE WHEN m.attribute = 41 THEN m.value END) as value,
+  MAX(CASE WHEN m.attribute = 42 THEN m.value END) as ordinal
+FROM schemas s
+JOIN eva_current membership
+  ON membership.attribute = 5          -- :entity/schema
+  AND membership.value = s.entity_id
+JOIN eva_current m
+  ON m.entity_id = membership.entity_id
+  AND m.attribute IN (41, 42)          -- :enum/value, :enum/ordinal
+GROUP BY s.entity_id, s.type, m.entity_id
+ORDER BY s.entity_id, ordinal, value;
