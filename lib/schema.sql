@@ -18,16 +18,31 @@ CREATE INDEX IF NOT EXISTS idx_tx_created
 -- ============================================================================
 
 CREATE TABLE IF NOT EXISTS attributes (
-  attribute_id INTEGER PRIMARY KEY,
-  name TEXT NOT NULL UNIQUE,
+  attribute_id INTEGER NOT NULL,
+  name TEXT NOT NULL,
   value_type INTEGER NOT NULL DEFAULT 0,  -- semantic type (see below)
   cardinality INTEGER NOT NULL DEFAULT 0, -- 0=single, 1=multi
   unique_value INTEGER NOT NULL DEFAULT 0,
   doc TEXT,
+
+  asserted_at INTEGER NOT NULL,        -- tx_id when asserted
+  retracted_at INTEGER,                -- tx_id when retracted, NULL if current
+
+  UNIQUE (attribute_id, asserted_at),
+
   CHECK (value_type BETWEEN 0 AND 6),
   CHECK (cardinality IN (0, 1)),
-  CHECK (unique_value IN (0, 1))
+  CHECK (unique_value IN (0, 1)),
+  CHECK (attribute_id >= 0),
+
+  FOREIGN KEY (asserted_at) REFERENCES transactions(tx_id),
+  FOREIGN KEY (retracted_at) REFERENCES transactions(tx_id)
 ) STRICT;
+
+-- Ensure attribute names are unique in current state
+CREATE UNIQUE INDEX IF NOT EXISTS idx_attr_unique_name
+  ON attributes(name)
+  WHERE retracted_at IS NULL;
 
 -- value_type reference:
 --   0 = string  (TEXT)
@@ -37,6 +52,24 @@ CREATE TABLE IF NOT EXISTS attributes (
 --   4 = ref     (INTEGER entity ID)
 --   5 = json    (TEXT)
 --   6 = blob    (BLOB)
+
+-- ============================================================================
+-- Auto-Retraction Trigger for Attributes
+-- ============================================================================
+
+-- Automatically retract previous attribute definitions when a new version is asserted.
+-- Since all attribute changes are single-cardinality, any new entry overwrites old ones.
+-- IMPORTANT: This must be a BEFORE trigger so retractions happen before uniqueness checks.
+CREATE TRIGGER IF NOT EXISTS auto_retract_previous_attr
+BEFORE INSERT ON attributes
+WHEN NEW.retracted_at IS NULL
+BEGIN
+  UPDATE attributes
+  SET retracted_at = NEW.asserted_at
+  WHERE attribute_id = NEW.attribute_id
+    AND asserted_at < NEW.asserted_at
+    AND retracted_at IS NULL;
+END;
 
 -- ============================================================================
 -- EVA - Core triple store
@@ -69,7 +102,7 @@ CREATE TABLE IF NOT EXISTS eva (
 CREATE TRIGGER IF NOT EXISTS auto_retract_previous
 AFTER INSERT ON eva
 WHEN NEW.retracted_at IS NULL
-  AND (SELECT cardinality FROM attributes WHERE attribute_id = NEW.attribute) = 0
+  AND (SELECT cardinality FROM attributes WHERE attribute_id = NEW.attribute AND retracted_at IS NULL) = 0
 BEGIN
   UPDATE eva
   SET retracted_at = NEW.asserted_at
@@ -82,6 +115,24 @@ END;
 -- ============================================================================
 -- Indexes
 -- ============================================================================
+
+-- Attributes: Current state by attribute_id
+CREATE INDEX IF NOT EXISTS idx_attr_current
+  ON attributes(attribute_id)
+  WHERE retracted_at IS NULL;
+
+-- Attributes: Current state by name
+CREATE INDEX IF NOT EXISTS idx_attr_current_name
+  ON attributes(name)
+  WHERE retracted_at IS NULL;
+
+-- Attributes: Transaction history
+CREATE INDEX IF NOT EXISTS idx_attr_asserted_at
+  ON attributes(asserted_at, attribute_id);
+
+CREATE INDEX IF NOT EXISTS idx_attr_retracted_at
+  ON attributes(retracted_at, attribute_id)
+  WHERE retracted_at IS NOT NULL;
 
 -- Current state by entity
 CREATE INDEX IF NOT EXISTS idx_eva_current_entity
@@ -117,21 +168,35 @@ VALUES (1, datetime('now'));
 -- Bootstrap Attribute Definitions
 -- ============================================================================
 
-INSERT OR IGNORE INTO attributes VALUES (5,  ':entity/schema',         4, 1, 0, 'Schema entity_id for this entity');
-INSERT OR IGNORE INTO attributes VALUES (11, ':schema/type',           0, 0, 1, 'Human-readable type name (must be unique)');
-INSERT OR IGNORE INTO attributes VALUES (12, ':schema/version',        0, 0, 0, 'Semantic version string');
-INSERT OR IGNORE INTO attributes VALUES (13, ':schema/doc',            0, 0, 0, 'Schema documentation');
-INSERT OR IGNORE INTO attributes VALUES (31, ':schema/attr',           4, 1, 0, 'Attribute IDs in this schema');
-INSERT OR IGNORE INTO attributes VALUES (32, ':schema/attr/required',  4, 1, 0, 'Set of attr_ids that are required for this schema');
+-- (attribute_id, name, value_type, cardinality, unique_value, doc, asserted_at, retracted_at)
+INSERT OR IGNORE INTO attributes VALUES (5,  ':entity/schema',         4, 1, 0, 'Schema entity_id for this entity', 1, NULL);
+INSERT OR IGNORE INTO attributes VALUES (11, ':schema/type',           0, 0, 1, 'Human-readable type name (must be unique)', 1, NULL);
+INSERT OR IGNORE INTO attributes VALUES (12, ':schema/version',        0, 0, 0, 'Semantic version string', 1, NULL);
+INSERT OR IGNORE INTO attributes VALUES (13, ':schema/doc',            0, 0, 0, 'Schema documentation', 1, NULL);
+INSERT OR IGNORE INTO attributes VALUES (31, ':schema/attr',           4, 1, 0, 'Attribute IDs in this schema', 1, NULL);
+INSERT OR IGNORE INTO attributes VALUES (32, ':schema/attr/required',  4, 1, 0, 'Set of attr_ids that are required for this schema', 1, NULL);
 
-INSERT OR IGNORE INTO attributes VALUES (6,  ':attr/of-schema',        4, 1, 0, 'Target schema(s) for ref values (anyOf constraint)');
+INSERT OR IGNORE INTO attributes VALUES (6,  ':attr/of-schema',        4, 1, 0, 'Target schema(s) for ref values (anyOf constraint)', 1, NULL);
 
-INSERT OR IGNORE INTO attributes VALUES (41, ':enum/value',            0, 0, 1, 'Enum member label (unique across all enums)');
-INSERT OR IGNORE INTO attributes VALUES (42, ':enum/ordinal',          1, 0, 0, 'Sort order within enum');
+INSERT OR IGNORE INTO attributes VALUES (41, ':enum/value',            0, 0, 1, 'Enum member label (unique across all enums)', 1, NULL);
+INSERT OR IGNORE INTO attributes VALUES (42, ':enum/ordinal',          1, 0, 0, 'Sort order within enum', 1, NULL);
 
 -- ============================================================================
 -- Views
 -- ============================================================================
+
+-- Current state of all attribute definitions
+CREATE VIEW IF NOT EXISTS attributes_current AS
+  SELECT
+    attribute_id,
+    name,
+    value_type,
+    cardinality,
+    unique_value,
+    doc,
+    asserted_at
+  FROM attributes
+  WHERE retracted_at IS NULL;
 
 -- Current state of all facts
 CREATE VIEW IF NOT EXISTS eva_current AS
@@ -168,7 +233,7 @@ SELECT
   CASE WHEN e2.value IS NOT NULL THEN 1 ELSE 0 END as required
 FROM eva_current e1
 JOIN schemas s ON e1.entity_id = s.entity_id
-LEFT JOIN attributes a ON e1.value = a.attribute_id
+LEFT JOIN attributes_current a ON e1.value = a.attribute_id
 LEFT JOIN eva_current e2
   ON e1.entity_id = e2.entity_id
   AND e2.attribute = 32
